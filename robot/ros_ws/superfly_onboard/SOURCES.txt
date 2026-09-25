@@ -1,0 +1,19 @@
+# Copied 2026-09-25T22:12:48Z from the working tree of /home/jason/superfly_rgb_nav (git HEAD 580e838; working-tree versions, uncommitted changes included).
+# dest_path  sha256  source_path
+onboard_policy_runner.py  cc05910a778d75b0bda2b5ca80e31c253ffbecbf23d38efc06d0e399b7aa0a32  /home/jason/superfly_rgb_nav/deploy/onboard/board/onboard_policy_runner.py
+superfly/__init__.py  fa3cffb2c2a9f720c70d3a4b20c5715a706bc7a3642e1df19b7943e27136d6c9  /home/jason/superfly_rgb_nav/bench/src/superfly/__init__.py
+superfly/common/__init__.py  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /home/jason/superfly_rgb_nav/bench/src/superfly/common/__init__.py
+superfly/common/rgb_transport.py  d4eab609a7668978d8a936a1779df901e8f997308940b3dcfe8ee5a9fc9f9d9b  /home/jason/superfly_rgb_nav/bench/src/superfly/common/rgb_transport.py
+superfly/common/slot.py  43a8802964cecd4080f534ebcc1da1303eb0358cefcf9ef589d48184ce39def9  /home/jason/superfly_rgb_nav/bench/src/superfly/common/slot.py
+models/encoder_int8_ptdense.tflite  b1eaeeff11a67c99bc5dec0316173e8372e87034c213c25ac95bd65a55b09d9c  /home/jason/superfly_rgb_nav/deploy/onboard/board/models/encoder_int8_ptdense.tflite
+models/head_fp32.tflite  a37e1680844685595d605cb662241ef470bcea6298a7c89dc4f315c97127a8bd  /home/jason/superfly_rgb_nav/deploy/onboard/board/models/head_fp32.tflite
+models/dinov3-cnxt-tiny-tflite-fp16-gpufix-v0.tflite  c0293af2f05867790a28b346a9c51af889159a3efdb76819c59caf947286676c  /home/jason/superfly_rgb_nav/results/15.11.6.2-dinov3-gpu-delegate/artifacts/dinov3-cnxt-tiny-tflite-fp16-gpufix-v0.tflite
+models/dnav-rgb-dinov3-cnxt-tiny-tok-vel-starling-orew-ts2-4-v0-head.tflite  d01bd9c3b3f06b6d092f71a28f2f84921696c578fdaf61069e31adda5d092027  /home/jason/superfly_rgb_nav/tmp/deploy_push/headexport/dnav-rgb-dinov3-cnxt-tiny-tok-vel-starling-orew-ts2-4-v0-head.tflite
+rgb_bridge_voxl.py  1c58407b948ac2b83480f6818cea2a4360d9e95775ab1fe339283c73240fda2c  /home/jason/superfly_rgb_nav/deploy/onboard/ground/rgb_bridge_voxl.py
+#
+# NOTE (2026-09-25): models/dnav-...-head.tflite (d01bd9c3...) is the 2026-09-25 re-export
+# (tmp/deploy_push/headexport) of the SAME checkpoint as the board's head (level1_1.pth,
+# sha 090ac8a4...). The head deployed on the board 2026-09-23 is e571401f... (superfly
+# results/15.11.6.4-dinov3-cnxt-board-speedup/RUNBOOK.md); that .tflite is no longer on
+# this machine. Both exports pass the same parity checks (tflite-vs-ort ~2e-6). For a
+# byte-identical copy: adb pull /data/superfly/dnav-rgb-dinov3-cnxt-tiny-tok-vel-starling-orew-ts2-4-v0-head.tflite

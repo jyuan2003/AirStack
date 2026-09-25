@@ -1,0 +1,109 @@
+# SVG ground control — RGB navigation policy on the GROUND (function 2),
+# ONE real drone (ModalAI Starling 2 Max + mocap).
+#
+# State: mocap -> mocap_bridge -> uXRCE -> PX4 EKF2 -> px4_interface odometry.
+# Images: rgb_bridge_voxl.py on the VOXL streams 224x224 RGB (SFRG/UDP) to
+#   this PC, port 15003 (rgb_policy_rgb_port).
+# Policy: the superfly ONBOARD runner (onboard_policy_runner.py) + models,
+#   copied into robot/ros_ws/superfly_onboard (gitignored, see SOURCES.txt),
+#   CPU TFLite (ai_edge_litert must be pip-installed in the container).
+# Command: /drone_1/fmu/velocity_command, linear = policy velocity (ENU),
+#   angular.z = yaw_kp * wrap(policy heading - measured heading).
+#
+#   ros2 launch svg_ground_control real_interfaces.launch.py drones:=drone_1
+#   ros2 launch svg_ground_control ground_control.launch.py \
+#       config:=<share>/config/rgb_policy_real.yaml use_mocap:=true
+#   ros2 service call /swarm_commander/takeoff std_srvs/srv/Trigger
+#   ros2 service call /swarm_commander/start   std_srvs/srv/Trigger  # ALIGN -> POLICY
+#   ros2 service call /swarm_commander/hold    std_srvs/srv/Trigger  # panic: hold here
+#
+# Every ~/start begins a fresh policy episode (hand-over latch + ALIGN).
+
+swarm_commander:
+  ros__parameters:
+    drone_names: ["drone_1"]
+    drone_modes: "real"
+    teleop_drones: ""
+    external_drones: ""
+    cbf_exempt_drones: ""
+
+    scenario: "rgb_policy"
+    scenario_speed_mps: 0.5
+    scenario_seed: 7
+    arena_low: [-1.5, -1.5, 0.8]
+    arena_high: [1.5, 1.5, 1.8]
+    # Zeros: mocap anchors the EKF to the shared mocap origin.
+    drone_position_offsets: [0.0, 0.0, 0.0]
+    # Takeoff / hold position (world ENU); the policy starts from here.
+    hover_positions: [-2.0, 0.0, 1.2]
+
+    # ---- rgb_policy ----------------------------------------------------
+    # Path INSIDE the robot container (the repo is mounted at /root/AirStack).
+    rgb_policy_superfly_dir: "/root/AirStack/robot/ros_ws/superfly_onboard"
+    # agile-rgb-cl4nav-r50-int8ptdense-vel-tartanair-v1  (agile, ~2.4 ms/tick)
+    # dnav-rgb-dinov3-cnxt-tiny-tok-vel-starling-orew-ts2-4-v0  (dnav, ~12-20 ms/tick)
+    rgb_policy_variant: "dnav-rgb-dinov3-cnxt-tiny-tok-vel-starling-orew-ts2-4-v0"
+    rgb_policy_goal: [2.0, 0.0, 1.2]         # world ENU (mocap frame), z = alt-hold ref
+    rgb_policy_target_speed: 2.0             # dnav only; training band 2-4 m/s
+    rgb_policy_max_vel: 0.5                  # |v_xy| cap (runner --max-vel)
+    rgb_policy_goal_radius: 1.0              # horizontal arrival radius (m)
+    rgb_policy_align_tol_deg: 1.0            # fly_indoor.sh --align-tol-deg
+    rgb_policy_align_timeout_s: 30.0         # fly_indoor.sh --align-timeout-s
+    rgb_policy_threads: 8                    # TFLite CPU threads
+    rgb_policy_alt_hold: true                # runner --alt-hold (with --planar)
+    rgb_policy_alt_hold_kp: 2.0              # runner defaults
+    rgb_policy_alt_hold_kd: 1.0
+    rgb_policy_alt_hold_max_vz: 1.5
+    rgb_policy_rgb_bind: "0.0.0.0"
+    rgb_policy_rgb_port: 15003
+    rgb_policy_frame_stale_s: 0.25           # older frame -> zero velocity
+
+    # Heading loop: angular.z = clip(yaw_kp * wrap(target - yaw), +-yaw_rate_max)
+    yaw_kp: 1.5
+    yaw_rate_max: 1.5
+
+    state_topic_template: "/{name}/odometry_conversion/odometry"
+    teleop_topic_template: "/svg/{name}/teleop_command"
+
+    control_rate_hz: 15.0                    # the policies' training rate
+    state_timeout_s: 0.5
+    teleop_timeout_s: 0.5
+
+    hover_kp: 1.0
+    arrival_threshold_m: 0.15
+    land_speed_mps: 0.3
+    land_complete_altitude_m: 0.15
+
+    # One drone: the CBF only caps |v|; keep it above the policy's 0.5 m/s.
+    cbf_safety_radius_m: 0.55
+    cbf_max_speed_mps: 1.0
+    cbf_alpha: 2.5
+    teleop_max_speed_mps: 1.0
+
+    # Geofence: the swarm_real capture volume. breach -> hold, ~/reset_fence
+    fence_enabled: true
+    fence_min: [-4.0, -2.0, 0.0]
+    fence_max: [4.0, 2.0, 3.0]
+
+mocap_bridge:
+  ros__parameters:
+    drone_names: ["drone_1"]
+    mocap_topic_template: "/{name}/pose"
+    px4_vio_mode: "direct"
+    px4_vio_frame: "enu_to_ned"
+    vio_quality: 100
+    px4_vio_topic_template: "/{name}/fmu/in/vehicle_visual_odometry"
+    visual_odometry_topic_template: "/{name}/fmu/visual_odometry_in"
+    mocap_frame: "map"
+    velocity_filter_alpha: 0.4
+    mocap_qos_best_effort: false
+
+# Onboard LED strip (svg-led on the VOXL): drone_1 only, as in swarm_real.yaml.
+led_controller:
+  ros__parameters:
+    drone_names: ["drone_1"]
+    default_color: "green"
+    cbf_color: "red"
+    cbf_hold_s: 0.5
+    brightness: 80
+    heartbeat_port: 47901

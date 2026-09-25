@@ -9,7 +9,11 @@ on hardware — only the topic templates in the config YAML differ):
     services:    {robot_command_service_template}  airstack_msgs/srv/RobotCommand
 
 Nominal commands come from a *scenario* (hover, random_walk, random_goals,
-head_on, antipodal, squeeze — see scenarios.py, ported from ~/drone_soccer).
+head_on, antipodal, squeeze — see scenarios.py, ported from ~/drone_soccer;
+rgb_policy — a superfly RGB navigation policy flying one drone).
+A scenario may also hand out per-drone heading targets (``yaw_targets``); the
+commander turns them into ``twist.angular.z`` with a P-loop (``yaw_kp``,
+clipped to ``yaw_rate_max``). Without a target angular.z stays 0.
 Drones listed in ``teleop_drones`` are operator-driven instead (one teleop
 topic per drone); an empty list means every drone follows the scenario.
 Drones in ``external_drones`` are tracked for the safety filter but never
@@ -67,7 +71,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 from airstack_msgs.srv import RobotCommand
 
 from svg_ground_control.cbf_filter import filter_velocities
-from svg_ground_control.scenarios import Bounds, make_scenario
+from svg_ground_control.scenarios import (
+    Bounds, make_scenario, yaw_from_quaternion_xyzw, yaw_rate_toward_target)
 
 
 class FlightState(Enum):
@@ -97,6 +102,8 @@ class DroneHandle:
         self.state = FlightState.IDLE
         self.position = None              # np (3,) ENU, None until first odometry
         self.velocity = np.zeros(3)
+        self.orientation = None           # np (4,) x,y,z,w FLU->ENU, None until odometry
+        self.body_rates = np.zeros(3)     # body FLU angular rates (rad/s)
         self.last_odom_time = None        # rclpy Time
         self.arming_start = None          # rclpy Time
         self.arming_steps_done = set()
@@ -161,6 +168,27 @@ class SwarmCommander(Node):
         # Used by the 'hover' scenario only: flat [x1,y1,z1, ...] per drone.
         self.declare_parameter('hover_positions',
                                [-1.5, 0.0, 1.2, 1.5, 0.0, 1.2, 0.0, -1.5, 1.2])
+        # 'rgb_policy' scenario (one drone; takeoff at hover_positions[0]).
+        # The policy is the superfly onboard runner's, loaded from
+        # rgb_policy_superfly_dir (gitignored copy + models, see SOURCES.txt).
+        self.declare_parameter('rgb_policy_superfly_dir',
+                               '/root/AirStack/robot/ros_ws/superfly_onboard')
+        self.declare_parameter('rgb_policy_variant',
+                               'agile-rgb-cl4nav-r50-int8ptdense-vel-tartanair-v1')
+        self.declare_parameter('rgb_policy_goal', [2.0, 0.0, 1.2])  # world ENU
+        self.declare_parameter('rgb_policy_target_speed', 2.0)      # dnav only
+        self.declare_parameter('rgb_policy_max_vel', 0.5)
+        self.declare_parameter('rgb_policy_goal_radius', 1.0)
+        self.declare_parameter('rgb_policy_align_tol_deg', 1.0)
+        self.declare_parameter('rgb_policy_align_timeout_s', 30.0)
+        self.declare_parameter('rgb_policy_threads', 8)
+        self.declare_parameter('rgb_policy_alt_hold', True)
+        self.declare_parameter('rgb_policy_alt_hold_kp', 2.0)
+        self.declare_parameter('rgb_policy_alt_hold_kd', 1.0)
+        self.declare_parameter('rgb_policy_alt_hold_max_vz', 1.5)
+        self.declare_parameter('rgb_policy_rgb_bind', '0.0.0.0')
+        self.declare_parameter('rgb_policy_rgb_port', 15003)
+        self.declare_parameter('rgb_policy_frame_stale_s', 0.25)
 
         # Per-drone position offset (flat [x1,y1,z1, ...]) ADDED to incoming
         # odometry to bring every drone into one shared world frame. Needed
@@ -219,6 +247,9 @@ class SwarmCommander(Node):
 
         # Hold/ascend P-controller
         self.declare_parameter('hover_kp', 1.0)
+        # Heading P-loop for scenario yaw targets (angular.z, ENU CCW+).
+        self.declare_parameter('yaw_kp', 1.5)
+        self.declare_parameter('yaw_rate_max', 1.5)
         self.declare_parameter('arrival_threshold_m', 0.15)
 
         # Landing
@@ -285,6 +316,8 @@ class SwarmCommander(Node):
         self.state_timeout = float(self.get_parameter('state_timeout_s').value)
         self.teleop_timeout = float(self.get_parameter('teleop_timeout_s').value)
         self.hover_kp = float(self.get_parameter('hover_kp').value)
+        self.yaw_kp = float(self.get_parameter('yaw_kp').value)
+        self.yaw_rate_max = float(self.get_parameter('yaw_rate_max').value)
         self.arrival_threshold = float(self.get_parameter('arrival_threshold_m').value)
         self.land_speed = float(self.get_parameter('land_speed_mps').value)
         self.land_complete_alt = float(
@@ -313,6 +346,29 @@ class SwarmCommander(Node):
                 self.get_parameter('squeeze_intruder_waypoints').value)
             scenario_kwargs['intruder_cbf_exempt'] = bool(
                 self.get_parameter('squeeze_intruder_cbf_exempt').value)
+        elif scenario_name == 'rgb_policy':
+            def p(name):
+                return self.get_parameter('rgb_policy_' + name).value
+            scenario_kwargs.update(
+                hover_positions=np.array(self.get_parameter('hover_positions').value),
+                superfly_dir=str(p('superfly_dir')),
+                policy_variant=str(p('variant')),
+                goal=np.array(p('goal'), dtype=float),
+                target_speed=float(p('target_speed')),
+                max_vel=float(p('max_vel')),
+                goal_radius=float(p('goal_radius')),
+                align_tol_deg=float(p('align_tol_deg')),
+                align_timeout_s=float(p('align_timeout_s')),
+                control_rate_hz=float(self.get_parameter('control_rate_hz').value),
+                threads=int(p('threads')),
+                alt_hold=bool(p('alt_hold')),
+                alt_hold_kp=float(p('alt_hold_kp')),
+                alt_hold_kd=float(p('alt_hold_kd')),
+                alt_hold_max_vz=float(p('alt_hold_max_vz')),
+                rgb_bind=str(p('rgb_bind')),
+                rgb_port=int(p('rgb_port')),
+                frame_stale_s=float(p('frame_stale_s')),
+                log=self.get_logger().info)
         self.scenario = make_scenario(
             scenario_name,
             num_drones=len(names),
@@ -492,6 +548,12 @@ class SwarmCommander(Node):
         # shared world frame (velocities are origin-independent).
         drone.position = np.array([p.x, p.y, p.z]) + drone.position_offset
         drone.velocity = np.array([v.x, v.y, v.z])
+        # Attitude FLU->ENU and body FLU rates (px4_interface converts from
+        # PX4's FRD/NED); used by full-state scenarios and the heading loop.
+        q = msg.pose.pose.orientation
+        drone.orientation = np.array([q.x, q.y, q.z, q.w])
+        w = msg.twist.twist.angular
+        drone.body_rates = np.array([w.x, w.y, w.z])
         drone.last_odom_time = self.get_clock().now()
 
     def teleop_callback(self, drone: DroneHandle, msg: TwistStamped):
@@ -729,7 +791,19 @@ class SwarmCommander(Node):
         scenario_nominal = None
         if self.mission_active and len(tracked) == len(self.drones):
             all_positions = np.stack([d.position for d in self.drones])
-            scenario_nominal = self.scenario.nominal_velocity(all_positions)
+            if self.scenario.needs_full_state:
+                # A drone with stale odometry has no attitude to steer on.
+                scenario_nominal = self.scenario.nominal_velocity(
+                    all_positions,
+                    velocities=np.stack([d.velocity for d in self.drones]),
+                    orientations=[d.orientation if self.odom_fresh(d, now)
+                                  else None for d in self.drones],
+                    body_rates=np.stack([d.body_rates for d in self.drones]))
+            else:
+                scenario_nominal = self.scenario.nominal_velocity(all_positions)
+        # Heading targets are only honored on ticks the scenario was stepped.
+        yaw_targets = (self.scenario.yaw_targets
+                       if scenario_nominal is not None else None)
 
         scenario_exempt = (set(self.scenario.cbf_exempt_indices)
                            if self.mission_active else set())
@@ -839,10 +913,7 @@ class SwarmCommander(Node):
         for d in self.drones:
             if not d.commanded or d.state == FlightState.IDLE:
                 continue
-            fresh = (d.last_odom_time is not None
-                     and (now - d.last_odom_time)
-                     < Duration(seconds=self.state_timeout))
-            if not fresh:
+            if not self.odom_fresh(d, now):
                 self.get_logger().warn(
                     f'{d.name}: odometry stale, commanding zero velocity',
                     throttle_duration_sec=1.0)
@@ -856,17 +927,37 @@ class SwarmCommander(Node):
                 self.get_logger().info(f'{d.name}: landed, disarmed')
                 continue
 
-            self.publish_velocity(d, safe[index[d.name]], now)
+            # Scenario heading target -> yaw rate, for scenario-driven drones
+            # in the mission only; everything else keeps angular.z = 0.
+            yaw_rate = 0.0
+            if (yaw_targets is not None and d.role == 'auto'
+                    and d.state == FlightState.ACTIVE
+                    and d.orientation is not None):
+                target = yaw_targets[self.drones.index(d)]
+                if target is not None:
+                    yaw_rate = yaw_rate_toward_target(
+                        target, yaw_from_quaternion_xyzw(d.orientation),
+                        self.yaw_kp, self.yaw_rate_max)
+
+            self.publish_velocity(d, safe[index[d.name]], now, yaw_rate)
 
         self.publish_markers(now)
 
-    def publish_velocity(self, drone: DroneHandle, velocity: np.ndarray, now):
+    def odom_fresh(self, drone: DroneHandle, now) -> bool:
+        return (drone.last_odom_time is not None
+                and (now - drone.last_odom_time)
+                < Duration(seconds=self.state_timeout))
+
+    def publish_velocity(self, drone: DroneHandle, velocity: np.ndarray, now,
+                         yaw_rate: float = 0.0):
         msg = TwistStamped()
         msg.header.stamp = now.to_msg()
         msg.header.frame_id = 'map'
         msg.twist.linear.x = float(velocity[0])
         msg.twist.linear.y = float(velocity[1])
         msg.twist.linear.z = float(velocity[2])
+        # ENU yaw rate, CCW+ (px4_interface negates it into NED yawspeed).
+        msg.twist.angular.z = float(yaw_rate)
         drone.cmd_pub.publish(msg)
 
     # ------------------------------------------------------------------

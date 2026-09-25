@@ -21,12 +21,22 @@ Scenarios:
   separated by ``gap_factor * safety_radius`` while the third drone flies
   straight through the gap between them; the holders must yield and return.
 
+- ``rgb_policy``: ONE drone flown by a superfly RGB navigation policy (agile
+  or dnav), run on the ground from the copied onboard runner
+  (``onboard_policy_runner.py``); frames arrive over UDP from the drone.
+  Emits velocity AND a heading target (``yaw_targets``).
+
 Any drone listed in the commander's ``teleop_drones`` has its scenario row
 replaced by operator input, so e.g. the squeeze intruder can be hand-flown.
 """
 
 from __future__ import annotations
 
+import importlib
+import math
+import os
+import sys
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
@@ -74,8 +84,34 @@ def seek_velocity(
     return direction * speed
 
 
+def wrap_pi(angle: float) -> float:
+    """Wrap an angle into [-pi, pi]."""
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def yaw_from_quaternion_xyzw(q) -> float:
+    """ENU heading of body-x for a ROS (x, y, z, w) FLU->ENU quaternion.
+
+    Same quantity as ``atan2(R[1, 0], R[0, 0])`` of the rotation matrix.
+    """
+    x, y, z, w = (float(c) for c in q)
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def yaw_rate_toward_target(yaw_target: float, yaw_measured: float,
+                           kp: float, max_rate: float) -> float:
+    """Heading P-loop: ENU yaw rate (CCW+) = clip(kp * wrap(target - meas))."""
+    rate = float(kp) * wrap_pi(float(yaw_target) - float(yaw_measured))
+    return float(np.clip(rate, -abs(max_rate), abs(max_rate)))
+
+
 class Scenario(ABC):
     """A takeoff layout plus a nominal go-where policy for the swarm."""
+
+    # True if nominal_velocity() wants velocities / orientations / body rates
+    # in addition to positions. The commander passes them only then, so the
+    # position-only scenarios keep their one-argument signature.
+    needs_full_state = False
 
     def __init__(
         self,
@@ -97,13 +133,37 @@ class Scenario(ABC):
         ...
 
     @abstractmethod
-    def nominal_velocity(self, positions: np.ndarray) -> np.ndarray:
-        """Return shape (N, 3) nominal (pre-CBF) velocities for this state."""
+    def nominal_velocity(
+        self,
+        positions: np.ndarray,
+        velocities: Optional[np.ndarray] = None,
+        orientations: Optional[list] = None,
+        body_rates: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Return shape (N, 3) nominal (pre-CBF) velocities for this state.
+
+        Args:
+            positions: (N, 3) world ENU positions.
+            velocities: (N, 3) world ENU velocities (``needs_full_state``
+                scenarios only).
+            orientations: per drone, a ROS (x, y, z, w) FLU->ENU quaternion,
+                or None when that drone has no fresh attitude
+                (``needs_full_state`` scenarios only).
+            body_rates: (N, 3) body FLU angular rates, rad/s
+                (``needs_full_state`` scenarios only).
+        """
         ...
 
     @property
     def goals(self) -> Optional[np.ndarray]:
         """Current per-drone goal points (N, 3) for debugging, or None."""
+        return None
+
+    @property
+    def yaw_targets(self) -> Optional[list]:
+        """Per-drone ENU heading targets (rad), None entries (or None for the
+        whole swarm) where the scenario has no opinion. The commander turns a
+        target into a yaw rate; no target = zero yaw rate."""
         return None
 
     @property
@@ -433,6 +493,325 @@ class GoalScenario(Scenario):
         return self._goals
 
 
+# Where the gitignored copy of the superfly onboard runner + models lives in
+# the robot container (robot/ros_ws/superfly_onboard, see its SOURCES.txt).
+DEFAULT_SUPERFLY_DIR = '/root/AirStack/robot/ros_ws/superfly_onboard'
+
+
+def load_onboard_runner(superfly_dir: str):
+    """Import the copied ``onboard_policy_runner`` from ``superfly_dir``.
+
+    The directory also holds the minimal ``superfly`` package tree that
+    ``superfly.common.rgb_transport`` needs, so it goes on ``sys.path`` as a
+    whole. Refuses a same-named module already imported from elsewhere.
+    """
+    root = os.path.realpath(superfly_dir)
+    path = os.path.join(root, 'onboard_policy_runner.py')
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f'{path} not found; copy the superfly onboard runner into '
+            f'{superfly_dir} (see its SOURCES.txt)')
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    module = importlib.import_module('onboard_policy_runner')
+    if os.path.realpath(module.__file__) != path:
+        raise ImportError(
+            f'onboard_policy_runner already imported from {module.__file__}, '
+            f'not {path}')
+    return module
+
+
+class RgbPolicyScenario(Scenario):
+    """One drone flown by a superfly RGB navigation policy, on the ground.
+
+    Everything policy-side is the ONBOARD runner's own code
+    (``onboard_policy_runner.py``, copied into ``superfly_dir``): its argparse
+    builds ``args`` exactly as on the board, ``build_stack(args)`` builds the
+    variant from ``ONBOARD_VARIANTS`` (``OnboardAgilePolicy`` or
+    ``OnboardTokenPolicy``, CPU TFLite), and ``VelocityYawPublisher.encode``
+    applies the |v_xy| clamp, ``--alt-hold`` (``altitude_vz_ned``) and the
+    absolute heading of ``--yaw-out angle``. This class only replaces the
+    runner's I/O: state from the commander's odometry, frames from
+    ``RGBSubscriber`` (UDP from ``rgb_bridge_voxl.py``), command out as world
+    ENU velocity + an ENU heading target (``yaw_targets``).
+
+    Phases, per episode (an episode starts on the first call after the
+    mission was not running for ``episode_gap_s``, i.e. every ~/start):
+
+    1. hand-over: ``retarget(goal, pos)`` + ``engage(...)`` (runner's
+       OFFBOARD latch; the dnav START frame + GRU reset happen at its first
+       ``compute()``), ``--alt-hold`` reference = the goal's z;
+    2. ALIGN: zero velocity, heading target = goal bearing, until within
+       ``align_tol_deg`` or ``align_timeout_s`` (``--align-first``);
+    3. POLICY: one ``compute()`` per control tick (``--planar``,
+       ``--alt-hold``, ``--max-vel``), heading from the policy;
+    4. REACHED: horizontal distance < ``goal_radius`` -> zero velocity,
+       hold the heading measured on arrival.
+
+    A frame older than ``frame_stale_s`` (or none yet) or missing state
+    (no fresh attitude) -> zero velocity and hold the heading, no compute().
+
+    The dnav policy is built UNPIPELINED (``--no-pipeline``): the runner's
+    pipelined mode steps the GRU back to back as fast as inference allows
+    (~60 Hz on a desktop CPU), not at the trained 15 Hz; synchronous, one
+    GRU step per control tick is the trained rate, at ~12-20 ms per tick.
+    """
+
+    needs_full_state = True
+
+    ALIGN = 'ALIGN'
+    POLICY = 'POLICY'
+    REACHED = 'REACHED'
+
+    def __init__(
+        self,
+        *args,
+        policy_variant: str,
+        goal,
+        hover_positions,
+        superfly_dir: str = DEFAULT_SUPERFLY_DIR,
+        target_speed: Optional[float] = None,
+        max_vel: float = 0.5,
+        goal_radius: float = 1.0,
+        align_tol_deg: float = 1.0,
+        align_timeout_s: float = 30.0,
+        control_rate_hz: float = 15.0,
+        threads: int = 8,
+        alt_hold: bool = True,
+        alt_hold_kp: float = 2.0,
+        alt_hold_kd: float = 1.0,
+        alt_hold_max_vz: float = 1.5,
+        rgb_bind: str = '0.0.0.0',
+        rgb_port: int = 15003,
+        frame_stale_s: float = 0.25,
+        episode_gap_s: float = 0.5,
+        log=print,
+        policy=None,
+        frame_source=None,
+        clock=time.monotonic,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        if self.num_drones != 1:
+            raise ValueError(
+                f'rgb_policy scenario flies exactly 1 drone, got {self.num_drones}')
+        start = np.asarray(hover_positions, dtype=float).reshape(-1, 3)
+        if start.shape[0] != 1:
+            raise ValueError(
+                f'rgb_policy scenario needs 1 hover position, got {start.shape[0]}')
+        self._start = start
+        self._goal = np.asarray(goal, dtype=float).reshape(3)
+        self._log = log
+        self._clock = clock
+        self._frame_stale_s = float(frame_stale_s)
+        self._episode_gap_s = float(episode_gap_s)
+
+        opr = load_onboard_runner(superfly_dir)
+        self.runner = opr
+        if policy_variant not in opr.ONBOARD_VARIANTS:
+            raise ValueError(
+                f'unknown policy variant {policy_variant!r}; registered: '
+                f'{sorted(opr.ONBOARD_VARIANTS)}')
+        kind = opr.ONBOARD_VARIANTS[policy_variant]['kind']
+        # The runner's own command line, as fly_indoor.sh flies it (planar,
+        # alt-hold, align-first, absolute heading out), CPU TFLite.
+        argv = [
+            '--policy', policy_variant,
+            '--model-dir', os.path.join(os.path.realpath(superfly_dir), 'models'),
+            '--encoder-backend', 'tflite',
+            '--threads', str(int(threads)),
+            '--max-vel', repr(float(max_vel)),
+            '--planar',
+            '--rate', repr(float(control_rate_hz)),
+            '--goal-radius', repr(float(goal_radius)),
+            '--align-first',
+            '--align-tol-deg', repr(float(align_tol_deg)),
+            '--align-timeout-s', repr(float(align_timeout_s)),
+            '--yaw-out', 'angle',
+            '--alt-hold-kp', repr(float(alt_hold_kp)),
+            '--alt-hold-kd', repr(float(alt_hold_kd)),
+            '--alt-hold-max-vz', repr(float(alt_hold_max_vz)),
+            '--no-log-dir',
+        ]
+        if alt_hold:
+            argv.append('--alt-hold')
+        if kind == 'token':
+            if target_speed is None:
+                raise ValueError(f'{policy_variant} needs target_speed')
+            argv += ['--target-speed', repr(float(target_speed)), '--no-pipeline']
+        try:
+            self.args = opr.parse_args(argv)
+        except SystemExit as e:  # argparse error: already printed to stderr
+            raise ValueError(
+                f'onboard runner rejected the rgb_policy arguments {argv}') from e
+        self.argv = argv
+        args = self.args
+
+        if policy is None:
+            policy, _net_every = opr.build_stack(args)
+            if kind == 'agile':
+                # build_token_policy warms its encoder; do the same for agile
+                # so the first POLICY tick does not pay the first invoke.
+                policy.encoder(np.zeros((opr.NET_SIZE, opr.NET_SIZE, 3), np.uint8))
+        self.policy = policy
+        # main(): the command-type encoding the runner itself applies.
+        self._publisher = opr.VelocityYawPublisher(
+            None, max_vel_xy=policy.max_vel_xy,
+            yaw_rate_max=args.yaw_rate_max, yaw_mode=args.yaw_out,
+            alt_hold=bool(args.alt_hold) and bool(args.planar),
+            alt_hold_kp=args.alt_hold_kp, alt_hold_kd=args.alt_hold_kd,
+            alt_hold_max_vz=args.alt_hold_max_vz)
+        self._dt = 1.0 / float(args.rate)
+        self._align_tol = math.radians(float(args.align_tol_deg))
+
+        if frame_source is None:
+            from superfly.common.rgb_transport import RGBSubscriber
+            frame_source = RGBSubscriber(host=str(rgb_bind), port=int(rgb_port))
+        self.frame_source = frame_source
+
+        self._phase = None           # None until the first episode starts
+        self._need_engage = True
+        self._last_call = None
+        self._align_t0 = None
+        self._alt_ref_d = None       # --alt-hold reference, world NED down
+        self._yaw_target = None
+        self._hold_reason = None     # why the current tick holds, or None
+        self._hold_yaw = None
+        self.last_command = None     # the policy's last compute() dict
+        self.compute_ms = float('nan')
+        self._log(
+            f'rgb_policy: {policy_variant} ({kind}) goal ENU {self._goal.tolist()}'
+            f' | runner argv: {" ".join(argv)}')
+
+    # -- Scenario interface --------------------------------------------------
+    def initial_positions(self) -> np.ndarray:
+        return self._start.copy()
+
+    @property
+    def goals(self) -> Optional[np.ndarray]:
+        return self._goal[None, :].copy()
+
+    @property
+    def yaw_targets(self) -> Optional[list]:
+        return [self._yaw_target]
+
+    @property
+    def phase(self) -> Optional[str]:
+        return self._phase
+
+    def nominal_velocity(self, positions, velocities=None, orientations=None,
+                         body_rates=None) -> np.ndarray:
+        opr = self.runner
+        now = self._clock()
+        if self._last_call is None or now - self._last_call > self._episode_gap_s:
+            self._need_engage = True
+        self._last_call = now
+        out = np.zeros((1, 3))
+
+        q = None if orientations is None else orientations[0]
+        if q is None or velocities is None:
+            self._hold('no fresh state', None)
+            return out
+        pos = np.asarray(positions[0], dtype=float)
+        vel = np.asarray(velocities[0], dtype=float)
+        rates = (np.zeros(3) if body_rates is None
+                 else np.asarray(body_rates[0], dtype=float))
+        x, y, z, w = (float(c) for c in q)
+        R_enu = opr.quat_wxyz_to_matrix((w, x, y, z))
+        yaw = math.atan2(R_enu[1, 0], R_enu[0, 0])
+
+        if self._need_engage:
+            self._engage(pos, R_enu)
+        if self._phase == self.REACHED:
+            self._yaw_target = self._hold_yaw
+            return out
+
+        frame = self._fresh_frame()
+        if frame is None:
+            self._hold('frame stale or absent', yaw)
+        elif self._phase == self.ALIGN and not self._aligned(pos, yaw, now):
+            pass                     # zero velocity, heading -> goal bearing
+        else:
+            out[0] = self._policy_step(pos, vel, R_enu, rates, frame)
+
+        # The runner checks arrival after the tick's command, every tick.
+        dist_xy = float(np.linalg.norm((self._goal - pos)[:2]))
+        if dist_xy < float(self.args.goal_radius):
+            self._phase = self.REACHED
+            self._hold_yaw = yaw
+            self._log(f'rgb_policy: REACHED goal (d_xy={dist_xy:.2f} m < '
+                      f'{self.args.goal_radius} m); holding')
+        return out
+
+    # -- internals -------------------------------------------------------------
+    def _engage(self, pos, R_enu) -> None:
+        """The runner's hand-over latch (main(): OFFBOARD entered)."""
+        self._need_engage = False
+        self.policy.retarget(self._goal, pos)
+        self.policy.engage(pos, R_enu, self._goal)
+        # alt_ref_for() with --goal-z-mode absolute: the goal's own z (NED).
+        self._alt_ref_d = -float(self._goal[2])
+        self._phase = self.ALIGN if self.args.align_first else self.POLICY
+        self._align_t0 = None
+        self._hold_reason = None
+        self._log(f'rgb_policy: hand-over at ENU {np.round(pos, 2).tolist()}, '
+                  f'alt-hold ref z={self._goal[2]:.2f} m; {self._phase}')
+
+    def _fresh_frame(self):
+        frame, age = self.frame_source.latest_with_age()
+        if frame is None or age is None or age > self._frame_stale_s:
+            return None
+        return self.runner.to_net_frame(frame)
+
+    def _hold(self, reason: str, yaw: Optional[float]) -> None:
+        """Zero velocity, heading held at its value when the hold began."""
+        if self._hold_reason is None:
+            if yaw is not None:
+                self._hold_yaw = yaw
+            self._log(f'rgb_policy: HOLD ({reason})')
+        self._hold_reason = reason
+        self._yaw_target = self._hold_yaw if yaw is not None else None
+
+    def _resume(self) -> None:
+        if self._hold_reason is not None:
+            self._log(f'rgb_policy: hold cleared ({self._hold_reason}); '
+                      f'{self._phase}')
+            self._hold_reason = None
+
+    def _aligned(self, pos, yaw, now) -> bool:
+        """--align-first: True once the heading is within tolerance (or the
+        timeout passed) -> POLICY this tick; else turn toward the goal."""
+        self._resume()
+        bearing = math.atan2(self._goal[1] - pos[1], self._goal[0] - pos[0])
+        err = wrap_pi(bearing - yaw)
+        if self._align_t0 is None:
+            self._align_t0 = now
+            self._log(f'rgb_policy: ALIGN bearing {math.degrees(bearing):+.1f} '
+                      f'deg, heading {math.degrees(yaw):+.1f} deg')
+        waited = now - self._align_t0
+        if abs(err) <= self._align_tol or waited >= float(self.args.align_timeout_s):
+            self._phase = self.POLICY
+            self._log(f'rgb_policy: POLICY engaged after {waited:.2f} s '
+                      f'(heading error {math.degrees(err):+.1f} deg)')
+            return True
+        self._yaw_target = bearing
+        return False
+
+    def _policy_step(self, pos, vel, R_enu, rates, frame) -> np.ndarray:
+        opr = self.runner
+        self._resume()
+        t0 = time.perf_counter()
+        cmd = self.policy.compute(pos, vel, R_enu, rates, self._goal, frame)
+        self.compute_ms = (time.perf_counter() - t0) * 1e3
+        self.last_command = cmd
+        v_ned, _yaw_rate, yaw_sp_ned = self._publisher.encode(cmd, dict(
+            pos_ned=opr.swap_ne(pos), vel_ned=opr.swap_ne(vel),
+            yaw_ned=opr.yaw_ned_from_R_enu(R_enu), dt=self._dt,
+            alt_ref_d=self._alt_ref_d, state_src=None, state_last=None))
+        self._yaw_target = opr.wrap_pi(opr.swap_yaw(yaw_sp_ned))
+        return opr.swap_ne(v_ned)
+
+
 _SCENARIOS = {
     'hover': HoverScenario,
     'goal': GoalScenario,
@@ -441,6 +820,7 @@ _SCENARIOS = {
     'head_on': HeadOnScenario,
     'antipodal': AntipodalScenario,
     'squeeze': SqueezeScenario,
+    'rgb_policy': RgbPolicyScenario,
 }
 
 
@@ -457,14 +837,15 @@ def make_scenario(
 
     Args:
         name: one of ``hover``, ``random_walk``, ``random_goals``, ``head_on``,
-            ``antipodal``, ``squeeze``.
+            ``antipodal``, ``squeeze``, ``goal``, ``rgb_policy``.
         num_drones: number of drones (scenario rows match drone_names order).
         nominal_speed: nominal flight speed (m/s).
         bounds: arena box.
         safety_radius: CBF safety radius r (m), used for spacing decisions.
         seed: RNG seed for the randomized scenarios.
         **kwargs: scenario-specific options (``hover_positions`` for hover,
-            ``gap_factor`` / ``run_length`` for squeeze).
+            ``gap_factor`` / ``run_length`` for squeeze, ``policy_variant`` /
+            ``goal`` / ... for rgb_policy).
 
     Raises:
         ValueError: if ``name`` is unknown.
